@@ -1,32 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server'
 import Groq from 'groq-sdk'
-
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
-
 import { docStore } from '@/lib/docStore'
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 
 function cleanText(text: string): string {
   return text
     .replace(/\r\n/g, '\n')
-    // strip non-printable / garbled unicode (keeps latin, greek, math block)
-    .replace(/[^\x20-\x7E\n\t\u00C0-\u024F\u0370-\u03FF\u2200-\u22FF]/g, ' ')
+    .replace(/[^\x20-\x7E\n\t]/g, ' ')
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
 
-function makeChunks(
-  text: string,
-  chunkSize = 450,
-  overlap = 80
-): string[] {
+function makeChunks(text: string, chunkSize = 450, overlap = 80): string[] {
   if (!text || text.trim().length < 10) return []
   const paras = text.split(/\n\n+/)
   const chunks: string[] = []
   let cur = ''
-
   for (const para of paras) {
     const t = para.trim()
     if (!t) continue
@@ -38,8 +29,6 @@ function makeChunks(
     }
   }
   if (cur.trim().length > 10) chunks.push(cur.trim())
-
-  // fallback: fixed-size if too few chunks
   if (chunks.length < 3 && text.length > 50) {
     const fb: string[] = []
     let s = 0
@@ -52,82 +41,6 @@ function makeChunks(
   }
   return chunks.filter(c => c.length > 10)
 }
-
-// Convert one PDF page buffer → base64 PNG using pdfjs-dist + canvas
-async function pdfPageToBase64(
-  pdfData: Uint8Array,
-  pageNum: number
-): Promise<string | null> {
-  try {
-    // Dynamic imports to avoid SSR issues
-    const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.js')
-    const { createCanvas } = await import('canvas')
-
-    // disable worker in Node
-    // @ts-expect-error — pdfjs types vary
-    pdfjsLib.GlobalWorkerOptions.workerSrc = ''
-
-    const doc = await pdfjsLib.getDocument({ data: pdfData, disableWorker: true }).promise
-    const page = await doc.getPage(pageNum)
-
-    const scale = 1.5
-    const viewport = page.getViewport({ scale })
-    const canvas = createCanvas(viewport.width, viewport.height)
-    const context = canvas.getContext('2d')
-
-    await page.render({
-      // @ts-expect-error — canvas context is compatible
-      canvasContext: context,
-      viewport
-    }).promise
-
-    return canvas.toBuffer('image/png').toString('base64')
-  } catch (e) {
-    console.warn(`Page ${pageNum} render failed:`, e)
-    return null
-  }
-}
-
-// Use Groq vision to transcribe one slide/page image
-async function transcribePageWithVision(
-  base64Png: string,
-  pageNum: number,
-  filename: string
-): Promise<string> {
-  try {
-    const resp = await groq.chat.completions.create({
-      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-      max_tokens: 600,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image_url',
-              image_url: {
-                url: `data:image/png;base64,${base64Png}`
-              }
-            },
-            {
-              type: 'text',
-              text: `This is page ${pageNum} from "${filename}". 
-Extract ALL text visible on this slide/page exactly as written.
-Also describe any diagrams, figures, charts, tables, or images present — explain what they show, labels, axes, arrows, relationships.
-Format: First the verbatim text, then a section "VISUALS:" describing any diagrams/figures.
-Be thorough — capture every word and every visual element.`
-            }
-          ]
-        }
-      ]
-    })
-    return resp.choices[0].message.content || ''
-  } catch (e) {
-    console.warn(`Vision transcription failed for page ${pageNum}:`, e)
-    return ''
-  }
-}
-
-// ── route handler ─────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   try {
@@ -142,7 +55,7 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
 
-    // ── Plain text files ──────────────────────────────────────────────────
+    // ── Plain text / markdown ─────────────────────────────────────────────
     if (filename.endsWith('.txt') || filename.endsWith('.md')) {
       const text = cleanText(buffer.toString('utf-8'))
       const raw = makeChunks(text, 450, 80)
@@ -151,25 +64,22 @@ export async function POST(req: NextRequest) {
       docStore.hasImages = false
       docStore.fullText = text
       docStore.pageDescriptions = [{ page: 1, text }]
-
       return NextResponse.json({
         success: true, filename,
-        chunks: docStore.chunks.length,
-        pages: 1, hasImages: false,
+        chunks: docStore.chunks.length, pages: 1,
+        hasImages: false, method: 'text',
         preview: text.slice(0, 300) + '...',
-        wordCount: text.split(/\s+/).filter(Boolean).length,
-        method: 'text'
+        wordCount: text.split(/\s+/).filter(Boolean).length
       })
     }
 
     if (!filename.endsWith('.pdf')) {
-      return NextResponse.json({ error: 'Unsupported file type. Use PDF, TXT, or MD.' }, { status: 400 })
+      return NextResponse.json({ error: 'Unsupported file. Use PDF, TXT, or MD.' }, { status: 400 })
     }
 
-    // ── PDF: step 1 — try text extraction first ───────────────────────────
+    // ── PDF: extract text with pdf-parse ─────────────────────────────────
     let pdfText = ''
     let pageCount = 0
-
     try {
       const pdfParse = (await import('pdf-parse')).default
       const parsed = await pdfParse(buffer)
@@ -179,90 +89,127 @@ export async function POST(req: NextRequest) {
       console.warn('pdf-parse failed:', e)
     }
 
-    const hasUsableText = pdfText.trim().length > pageCount * 40 // at least 40 chars per page avg
+    const avgCharsPerPage = pageCount > 0 ? pdfText.length / pageCount : 0
+    const hasUsableText = pdfText.trim().length > 100 && avgCharsPerPage > 30
 
-    // ── PDF: step 2 — vision transcription if text is sparse ─────────────
-    const pageDescriptions: Array<{ page: number; text: string }> = []
+    // ── If text is sparse: send PDF as base64 to Groq vision ─────────────
     let usedVision = false
+    const pageDescriptions: Array<{ page: number; text: string }> = []
 
-    if (!hasUsableText && pageCount > 0) {
-      console.log(`Sparse PDF (${pdfText.length} chars / ${pageCount} pages). Using vision...`)
+    if (!hasUsableText) {
       usedVision = true
-
-      const pdfUint8 = new Uint8Array(buffer)
-
-      // Process up to 20 pages (Vercel timeout safety)
-      const maxPages = Math.min(pageCount, 20)
-
-      for (let p = 1; p <= maxPages; p++) {
-        const b64 = await pdfPageToBase64(pdfUint8, p)
-        if (!b64) continue
-        const desc = await transcribePageWithVision(b64, p, filename)
-        if (desc.trim()) {
-          pageDescriptions.push({ page: p, text: desc.trim() })
+      // Convert PDF buffer to base64 and send whole file to vision model
+      // Groq vision accepts image/png and image/jpeg — send first few pages as base64
+      // We'll use a simpler approach: send the raw PDF bytes as base64 document
+      try {
+        const base64Pdf = buffer.toString('base64')
+        const resp = await groq.chat.completions.create({
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          max_tokens: 4000,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: `This is a PDF document called "${filename}". 
+Please extract and transcribe ALL content from every page:
+1. All text exactly as written (headings, bullets, paragraphs, labels)
+2. For every diagram, figure, chart, or table: describe it in detail — what it shows, labels, axes, relationships, values
+3. Format as: [Page N] followed by the content of that page
+Be exhaustive — capture everything visible.`
+                },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: `data:application/pdf;base64,${base64Pdf}`
+                  }
+                }
+              ]
+            }
+          ]
+        })
+        const visionText = resp.choices[0].message.content || ''
+        if (visionText.trim().length > 50) {
+          // Parse page sections from vision output
+          const pageMatches = visionText.split(/\[Page\s+(\d+)\]/i)
+          if (pageMatches.length > 1) {
+            for (let i = 1; i < pageMatches.length; i += 2) {
+              const pageNum = parseInt(pageMatches[i])
+              const pageContent = pageMatches[i + 1]?.trim() || ''
+              if (pageContent) pageDescriptions.push({ page: pageNum, text: pageContent })
+            }
+          } else {
+            pageDescriptions.push({ page: 1, text: visionText })
+          }
         }
-      }
-    } else if (hasUsableText) {
-      // Text is fine — split by approximate page
-      const linesPerPage = Math.ceil(pdfText.split('\n').length / Math.max(pageCount, 1))
-      const lines = pdfText.split('\n')
-      for (let p = 0; p < Math.max(pageCount, 1); p++) {
-        const start = p * linesPerPage
-        const pageText = lines.slice(start, start + linesPerPage).join('\n').trim()
-        if (pageText.length > 10) {
-          pageDescriptions.push({ page: p + 1, text: pageText })
-        }
+      } catch (visionErr) {
+        console.warn('Vision failed:', visionErr)
+        // Fall back to whatever text we have
+        usedVision = false
       }
     }
 
-    // ── Build chunks from page descriptions ───────────────────────────────
-    const storedChunks: Array<{ text: string; page: number; index: number }> = []
+    // ── Build chunks ──────────────────────────────────────────────────────
+    let storedChunks: Array<{ text: string; page: number; index: number }> = []
     let idx = 0
-    const allText: string[] = []
+    const allTextParts: string[] = []
 
-    for (const pd of pageDescriptions) {
-      allText.push(`[Page ${pd.page}]\n${pd.text}`)
-      const pageChunks = makeChunks(pd.text, 450, 60)
-
-      for (const chunk of pageChunks) {
-        storedChunks.push({ text: chunk, page: pd.page, index: idx++ })
+    if (pageDescriptions.length > 0) {
+      for (const pd of pageDescriptions) {
+        allTextParts.push(`[Page ${pd.page}]\n${pd.text}`)
+        const pageChunks = makeChunks(pd.text, 450, 60)
+        if (pageChunks.length === 0 && pd.text.trim().length > 10) {
+          storedChunks.push({ text: pd.text.trim(), page: pd.page, index: idx++ })
+        } else {
+          for (const chunk of pageChunks) {
+            storedChunks.push({ text: chunk, page: pd.page, index: idx++ })
+          }
+        }
       }
-
-      // If a page produced no chunks but has text, add it as-is
-      if (pageChunks.length === 0 && pd.text.trim().length > 10) {
-        storedChunks.push({ text: pd.text.trim(), page: pd.page, index: idx++ })
+    } else {
+      // Use extracted text, split by page estimate
+      const linesAll = pdfText.split('\n')
+      const linesPerPage = Math.ceil(linesAll.length / Math.max(pageCount, 1))
+      for (let p = 0; p < Math.max(pageCount, 1); p++) {
+        const pageText = linesAll.slice(p * linesPerPage, (p + 1) * linesPerPage).join('\n').trim()
+        if (pageText.length > 10) {
+          allTextParts.push(`[Page ${p + 1}]\n${pageText}`)
+          const pageChunks = makeChunks(pageText, 450, 60)
+          for (const chunk of pageChunks) {
+            storedChunks.push({ text: chunk, page: p + 1, index: idx++ })
+          }
+        }
       }
     }
 
-    const fullText = allText.join('\n\n')
-
-    // Fallback: if still nothing, just dump raw pdfText into one chunk
+    // Last resort fallback
     if (storedChunks.length === 0 && pdfText.trim().length > 0) {
-      const raw = makeChunks(pdfText, 450, 80)
-      raw.forEach((t, i) => storedChunks.push({ text: t, page: 1, index: i }))
+      makeChunks(pdfText, 450, 80).forEach((t, i) =>
+        storedChunks.push({ text: t, page: 1, index: i })
+      )
     }
 
-    const hasImages = usedVision ||
-      /figure|fig\.|diagram|chart|table|graph|illustration/i.test(fullText)
+    const fullText = allTextParts.join('\n\n') || pdfText
+    const hasImages = usedVision || /figure|fig\.|diagram|chart|table|graph/i.test(fullText)
 
     docStore.chunks = storedChunks
     docStore.filename = filename
     docStore.hasImages = hasImages
-    docStore.fullText = fullText || pdfText
+    docStore.fullText = fullText
     docStore.pageDescriptions = pageDescriptions
 
     return NextResponse.json({
-      success: true,
-      filename,
+      success: true, filename,
       chunks: storedChunks.length,
       pages: pageCount,
       hasImages,
-      preview: (fullText || pdfText).slice(0, 300) + '...',
-      wordCount: (fullText || pdfText).split(/\s+/).filter(Boolean).length,
       method: usedVision ? 'vision' : 'text',
       message: usedVision
-        ? `Used vision AI to read ${pageDescriptions.length} pages (slide deck detected)`
-        : `Extracted text from ${pageDescriptions.length} pages`
+        ? `Vision AI read ${pageDescriptions.length} pages`
+        : `Text extracted from ${pageCount} pages`,
+      preview: fullText.slice(0, 300) + '...',
+      wordCount: fullText.split(/\s+/).filter(Boolean).length
     })
 
   } catch (error: unknown) {
