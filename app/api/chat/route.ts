@@ -59,7 +59,7 @@ export async function POST(req: NextRequest) {
     const agentSteps: Array<{ type: string; content: string }> = []
 
     // Build conversation for Groq
-    const groqMessages: Groq.Chat.ChatCompletionMessageParam[] = [
+    const groqMessages: Array<{role: string; content: string; tool_calls?: unknown; tool_call_id?: string}> = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...messages.map((m: { role: string; content: string }) => ({
         role: m.role as 'user' | 'assistant',
