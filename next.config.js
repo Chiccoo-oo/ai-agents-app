@@ -1,12 +1,13 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {
-    serverComponentsExternalPackages: ['pdf-parse'],
+    serverComponentsExternalPackages: ['pdf-parse', 'canvas', 'pdfjs-dist'],
   },
-  api: {
-    bodyParser: {
-      sizeLimit: '10mb',
-    },
+  webpack: (config, { isServer }) => {
+    if (isServer) {
+      config.externals = [...(config.externals || []), 'canvas']
+    }
+    return config
   },
 }
 
